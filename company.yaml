@@ -1,0 +1,55 @@
+# AI 開發公司 MVP — 設定檔
+# 所有可調參數都在這裡，程式碼內不硬編任何模型字串或限制數值。
+
+# ─── 編排器 ──────────────────────────────────────────────────────────────────
+poll_interval_sec: 3          # 主迴圈輪詢間隔（秒）
+pool_size: 2                  # 同時最多幾個執行容器（筆電建議 2，高規機器可調到 4）
+
+# ─── 模型設定 ────────────────────────────────────────────────────────────────
+#
+# reasoning_provider：推理型 agent（Spec、Review）用哪個服務
+#   "gemini"  → Gemini API 免費 tier（需 GEMINI_API_KEY，從 aistudio.google.com 取得）
+#   "claude"  → Anthropic API（需 ANTHROPIC_API_KEY + 付費帳號）
+#
+# 想切回 Claude：把下面兩行改成：
+#   reasoning_provider: "claude"
+#   reasoning_model: "claude-sonnet-4-6"
+#
+reasoning_provider: "gemini"
+reasoning_model: "gemini-2.5-flash"
+
+# 執行型 agent（Test、Code）：永遠走 claude -p（Claude Pro 訂閱涵蓋）
+coding_model: "claude-sonnet-4-6"
+
+# ─── 預算上限 ────────────────────────────────────────────────────────────────
+budget:
+  per_card_usd: 2.0           # 單張子卡 token 花費上限（超過 → paused）
+  per_day_usd: 30.0           # 全天花費上限
+
+# ─── 行為限制 ────────────────────────────────────────────────────────────────
+limits:
+  max_turns: 25               # claude -p 的迭代上限（防鬼打牆）
+  worker_timeout_sec: 1800    # 執行容器 wall-clock 逾時（30 分鐘）
+  review_max: 3               # 被 Review 退回幾次後轉 paused
+  retry_max: 2                # 因崩潰/逾時重試幾次後轉 paused
+
+# ─── 自主等級 ────────────────────────────────────────────────────────────────
+# supervised：每個 story 完成後等人類核准才合 dev（MVP 預設）
+# balanced：Phase 2 可考慮放寬
+autonomy_level: "supervised"
+
+# ─── Git ─────────────────────────────────────────────────────────────────────
+git:
+  default_branch: "dev"       # AI 自動合併的目標分支
+  protected_branch: "main"    # 永遠需要人類核准
+
+# ─── Docker ──────────────────────────────────────────────────────────────────
+docker:
+  worker_image: "ai-company-worker"
+  worker_network: "bridge"    # Phase 2 收緊為白名單網路
+
+# ─── Telegram ────────────────────────────────────────────────────────────────
+# 實際 token 放 .env，不要放這裡
+telegram:
+  notify_on_pause: true       # 卡片進 paused 時發通知
+  notify_on_approval: true    # 母卡待核准時發通知
