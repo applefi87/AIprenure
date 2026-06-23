@@ -1,0 +1,17 @@
+# Host machine dependencies (pip install -r requirements.txt)
+# These run on your laptop alongside orchestrator.py
+
+# Config
+pyyaml>=6.0
+
+# Env file loading
+python-dotenv>=1.0
+
+# Reasoning agents (Gemini provider — free tier)
+google-genai>=1.0
+
+# Reasoning agents (Claude provider — optional, needs paid API key)
+# anthropic>=0.40
+
+# Telegram bot (M5)
+# python-telegram-bot>=21.0

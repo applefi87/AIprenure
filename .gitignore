@@ -1,0 +1,28 @@
+# 憑證與設定
+.env
+*.key
+
+# DB 資料（真相在 git 歷史，DB 是執行時狀態）
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# Node
+node_modules/
+.npm/
+
+# Docker
+.docker/
+
+# OS
+.DS_Store
+Thumbs.db
