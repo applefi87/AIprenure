@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Python deps
+        run: |
+          pip install pytest pytest-asyncio httpx fastapi uvicorn
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Install Node deps
+        run: |
+          if [ -f package.json ]; then npm ci; fi
+
+      - name: Run Python tests
+        run: |
+          if [ -d tests ] || find . -name "test_*.py" -not -path "./.git/*" | grep -q .; then
+            pytest -q
+          else
+            echo "No Python tests found, skipping"
+          fi
+
+      - name: Run Node tests
+        run: |
+          if [ -f package.json ] && grep -q '"test"' package.json; then
+            npm test
+          else
+            echo "No Node tests found, skipping"
+          fi
+
+      # 安全掃描：禁止直接 SQL 寫入（只有 db.py 能碰 DB）
+      - name: Check DB access discipline
+        run: |
+          # 確保只有 db.py import sqlite3
+          violations=$(grep -r "import sqlite3" --include="*.py" . \
+            | grep -v "^./db.py" \
+            | grep -v "^./.git/" || true)
+          if [ -n "$violations" ]; then
+            echo "❌ DB 紀律違規：以下檔案不應 import sqlite3："
+            echo "$violations"
+            exit 1
+          fi
+          echo "✅ DB 紀律檢查通過"
