@@ -85,9 +85,11 @@ def _remove_worker(worker_id: str) -> None:
 ELIGIBLE_TRANSITIONS = [
     # Story: Spec agent path
     ("awaiting_approval", "refining", "story"),
-    # Task: TDD path (M2+)
-    ("todo",   "test_writing", "task"),
-    ("coding", "coding",       "task"),
+    # Task: TDD path (M2)
+    ("todo",        "test_writing", "task"),
+    ("coding",      "coding",       "task"),
+    # Task: GitHub PR + CI polling (M3)
+    ("in_review",   "in_review",    "task"),
 ]
 
 
@@ -308,6 +310,8 @@ def handle_task(card: dict, cfg: dict) -> None:
         _run_test_agent(card, cfg)
     elif status == "coding":
         _run_code_agent(card, cfg)
+    elif status == "in_review":
+        _handle_in_review(card, cfg)
     else:
         log.warning("No task handler for status=%s (%s)", status, card["id"])
         db.clear_card_owner(card["id"])
@@ -459,8 +463,104 @@ def _handle_task_retry(card: dict, cfg: dict, reason: str) -> None:
         log.info("Task %s retry %d/%d: %s", card["id"], retry_count, retry_max, reason)
 
 
+def _handle_in_review(card: dict, cfg: dict) -> None:
+    """
+    M3: GitHub PR + CI polling loop.
+
+    State machine (card stays in_review between polls):
+      1. No PR yet       -> push branch + create PR -> release
+      2. CI pending      -> release (poll again next cycle)
+      3. CI success      -> trigger merge -> done
+      4. CI failure      -> reset to coding
+    """
+    import github_api
+
+    card_id = card["id"]
+    wt = truth.worktree_path(card)
+
+    # Step 1: create PR if not yet done
+    pr_number = card.get("pr_number")
+    if not pr_number:
+        existing = github_api.get_pr_for_branch(card)
+        if existing:
+            pr_number = existing["number"]
+            db.update_card_status(card_id, "in_review", pr_number=pr_number)
+            log.info("Found existing PR #%d for %s", pr_number, card_id)
+        else:
+            try:
+                github_api.push_branch(card, wt)
+                pr_number = github_api.create_pr(card)
+                db.update_card_status(card_id, "in_review", pr_number=pr_number)
+                db.insert_event(
+                    event_type="pr_created",
+                    actor="orchestrator",
+                    card_id=card_id,
+                    metadata={"pr_number": pr_number},
+                )
+                log.info("PR #%d created for %s -- CI starting", pr_number, card_id)
+            except Exception as e:
+                log.error("Failed to push/create PR for %s: %s", card_id, e)
+                _handle_task_retry(card, cfg, "PR creation failed: " + str(e))
+                return
+        db.clear_card_owner(card_id)
+        return  # release; next poll checks CI
+
+    # Step 2-4: PR exists, check CI
+    try:
+        ci_status = github_api.get_ci_status(pr_number)
+    except Exception as e:
+        log.error("CI status check failed for %s PR#%d: %s", card_id, pr_number, e)
+        db.clear_card_owner(card_id)
+        return
+
+    if ci_status == "pending":
+        log.info("CI pending for %s PR#%d -- releasing for next poll", card_id, pr_number)
+        db.clear_card_owner(card_id)
+        return
+
+    if ci_status == "success":
+        try:
+            github_api.trigger_merge(pr_number, card_id)
+        except Exception as e:
+            log.error("Merge trigger failed for %s PR#%d: %s", card_id, pr_number, e)
+            db.clear_card_owner(card_id)
+            return
+
+        merged = github_api.wait_for_merge(pr_number, max_polls=20, interval_sec=15)
+        if merged:
+            db.update_card_status(card_id, "done")
+            db.clear_card_owner(card_id)
+            db.insert_event(
+                event_type="merged",
+                actor="orchestrator",
+                card_id=card_id,
+                old_status="in_review",
+                new_status="done",
+                metadata={"pr_number": pr_number},
+            )
+            log.info("Task %s merged and done (PR #%d)", card_id, pr_number)
+            truth.teardown_worktree(card)
+        else:
+            log.warning("Merge wait timed out for %s PR#%d", card_id, pr_number)
+            db.clear_card_owner(card_id)
+        return
+
+    # ci_status == "failure"
+    log.warning("CI failed for %s PR#%d -- resetting to coding", card_id, pr_number)
+    db.update_card_status(card_id, "coding", pr_number=None)
+    db.clear_card_owner(card_id)
+    db.insert_event(
+        event_type="ci_failed",
+        actor="orchestrator",
+        card_id=card_id,
+        old_status="in_review",
+        new_status="coding",
+        metadata={"pr_number": pr_number},
+    )
+
+
 def collect_finished_workers() -> None:
-    # Synchronous in M0-M2; M3+ would poll async subprocess exit codes
+    # Synchronous in M0-M3; future async poll goes here
     pass
 
 

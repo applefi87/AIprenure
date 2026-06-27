@@ -229,14 +229,19 @@ def branch_exists(branch: str) -> bool:
 
 
 # ------------------------------------------------------------------ #
-#  M3+ stubs                                                           #
+#  GitHub checks (M3)                                                  #
 # ------------------------------------------------------------------ #
 
 def pr_exists(card: dict) -> bool:
-    """Check whether a GitHub PR exists for this card. M3."""
-    raise NotImplementedError("pr_exists: implemented in M3")
+    """Return True if an open PR exists for this card's branch."""
+    import github_api
+    return github_api.get_pr_for_branch(card) is not None
 
 
 def ci_green(card: dict) -> bool:
-    """Check whether CI is green for this card's PR. M3."""
-    raise NotImplementedError("ci_green: implemented in M3")
+    """Return True if CI is passing for this card's PR."""
+    import github_api
+    pr_number = card.get("pr_number")
+    if not pr_number:
+        return False
+    return github_api.get_ci_status(pr_number) == "success"
