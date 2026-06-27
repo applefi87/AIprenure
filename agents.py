@@ -137,43 +137,83 @@ def _call_claude(model: str, system: str, context: dict) -> str:
 
 
 # ------------------------------------------------------------------ #
-#  Coding agent (Test, Code) - always uses claude -p (M2)             #
+#  Coding agent (Test, Code) - always uses claude -p                  #
 # ------------------------------------------------------------------ #
 
 def run_coding_agent(card: dict, role: str) -> dict:
     """
-    Run coding agent inside sandbox container via claude -p.
-    Covered by Claude Pro subscription (not API billing).
+    Run a coding agent (Test or Code) inside the sandbox container via claude -p.
+    Uses Claude Pro subscription auth (no API billing required).
 
     Args:
-        card: card dict (needs id, branch)
+        card: card dict — must include id, branch, title.
+              Optionally includes _acceptance_criteria (list of AC dicts)
+              injected by the orchestrator before calling.
         role: 'test' | 'code'
 
     Returns:
         {'exit_code': int, 'stdout': str, 'stderr': str}
     """
+    import truth  # imported here to avoid module-level import order issues
+
     cfg = _load_config()
     model = cfg.get("coding_model", "claude-sonnet-4-6")
     max_turns = cfg.get("limits", {}).get("max_turns", 25)
     timeout = cfg.get("limits", {}).get("worker_timeout_sec", 1800)
+    image = cfg.get("docker", {}).get("worker_image", "ai-company-worker")
+
+    log.info("run_coding_agent  card=%s  role=%s  model=%s", card["id"], role, model)
+
+    prompt = _build_coding_prompt(card, role)
+    work_dir = truth.setup_worktree(card)
+
+    cmd = [
+        "claude", "-p", prompt,
+        "--allowedTools", "Read,Edit,Bash",
+        "--permission-mode", "acceptEdits",
+        "--max-turns", str(max_turns),
+        "--output-format", "text",
+        "--model", model,
+    ]
+
+    result = truth.run_in_container(
+        image=image,
+        cmd=cmd,
+        work_dir=work_dir,
+        timeout_sec=timeout,
+    )
 
     log.info(
-        "[M0-STUB] run_coding_agent card=%s role=%s model=%s max_turns=%d",
-        card["id"], role, model, max_turns,
+        "run_coding_agent done  card=%s  role=%s  exit_code=%d",
+        card["id"], role, result.exit_code,
     )
-    # M2 implementation:
-    # prompt = build_prompt(card, role)
-    # cmd = [
-    #     "claude", "-p", prompt,
-    #     "--allowedTools", "Read,Edit,Bash",
-    #     "--permission-mode", "acceptEdits",
-    #     "--max-turns", str(max_turns),
-    #     "--output-format", "json",
-    #     "--cwd", f"/work/{card['branch']}",
-    #     "--model", model,
-    # ]
-    # return run_in_container(image="ai-company-worker", cmd=cmd, timeout_sec=timeout, ...)
-    raise NotImplementedError("run_coding_agent: implemented in M2")
+
+    return {
+        "exit_code": result.exit_code,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def _build_coding_prompt(card: dict, role: str) -> str:
+    """Build the prompt string passed to claude -p for Test or Code agent."""
+    role_prompt = _load_prompt(role)
+
+    lines = [
+        f"## Card: {card['id']}",
+        f"**Title**: {card['title']}",
+    ]
+    if card.get("body"):
+        lines.append(f"**Description**: {card['body']}")
+
+    acs = card.get("_acceptance_criteria") or []
+    if acs:
+        lines.append("")
+        lines.append("## Acceptance Criteria")
+        for i, ac in enumerate(acs, 1):
+            lines.append(f"{i}. {ac['text']}")
+
+    return role_prompt + "\n\n---\n\n" + "\n".join(lines)
 
 
 # ------------------------------------------------------------------ #

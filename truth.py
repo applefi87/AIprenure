@@ -1,22 +1,31 @@
 """
-truth.py — 真相查核（M2+ 填入實作）
-=====================================
-封裝所有「查 git / 跑測試 / 看 exit code」的確定性檢查。
-編排器只信這裡的回傳值，不信 agent 的自述。
+truth.py -- deterministic fact-checking
+========================================
+All "run container / check exit code / verify git" logic lives here.
+The orchestrator trusts only what this module returns -- never agent self-reports.
 
-M0：所有函式為 stub，回傳固定值以利骨架跑通。
-M2+：替換為真實容器呼叫。
+M0/M1: stubs
+M2:    run_in_container real, tests_fail / tests_pass via container
+M3:    pr_exists / ci_green via GitHub API
 """
 
 import logging
+import os
 import subprocess
 from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger("truth")
 
+REPO_ROOT = Path(__file__).parent
+WORKTREES_DIR = REPO_ROOT / ".worktrees"
+_HOME = Path(os.path.expanduser("~"))
+CLAUDE_AUTH_DIR = _HOME / ".claude"
 
-# ─── 容器執行（M2 填入）────────────────────────────────────────────────
+
+# ------------------------------------------------------------------ #
+#  ContainerResult                                                     #
+# ------------------------------------------------------------------ #
 
 class ContainerResult:
     def __init__(self, exit_code: int, stdout: str = "", stderr: str = ""):
@@ -24,106 +33,210 @@ class ContainerResult:
         self.stdout = stdout
         self.stderr = stderr
 
+    def __repr__(self) -> str:
+        return (
+            f"ContainerResult(exit_code={self.exit_code}, "
+            f"stdout={self.stdout[:80]!r})"
+        )
+
+
+# ------------------------------------------------------------------ #
+#  Git worktree management                                             #
+# ------------------------------------------------------------------ #
+
+def worktree_path(card: dict) -> Path:
+    """Return host path for this card's git worktree."""
+    return WORKTREES_DIR / card["id"]
+
+
+def setup_worktree(card: dict) -> Path:
+    """
+    Ensure a git worktree exists for this card's branch.
+    Creates the branch and worktree if they don't exist.
+    Returns the worktree path (used as Docker volume mount).
+    """
+    wt = worktree_path(card)
+    card_id = card["id"]
+    branch = card.get("branch") or f"card/{card_id}"
+    WORKTREES_DIR.mkdir(parents=True, exist_ok=True)
+
+    if wt.exists():
+        log.debug("Worktree already exists: %s", wt)
+        return wt
+
+    # Create branch if it does not exist yet
+    r = subprocess.run(
+        ["git", "branch", "--list", branch],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    if not r.stdout.strip():
+        subprocess.run(
+            ["git", "branch", branch],
+            cwd=REPO_ROOT, check=True, capture_output=True,
+        )
+        log.info("Created branch %s", branch)
+
+    # Add worktree
+    subprocess.run(
+        ["git", "worktree", "add", str(wt), branch],
+        cwd=REPO_ROOT, check=True,
+    )
+    log.info("Worktree created: %s  (branch=%s)", wt, branch)
+    return wt
+
+
+def teardown_worktree(card: dict) -> None:
+    """Remove worktree after card is done."""
+    wt = worktree_path(card)
+    subprocess.run(
+        ["git", "worktree", "remove", str(wt), "--force"],
+        cwd=REPO_ROOT, capture_output=True,
+    )
+    log.info("Worktree removed: %s", wt)
+
+
+# ------------------------------------------------------------------ #
+#  Container execution                                                  #
+# ------------------------------------------------------------------ #
 
 def run_in_container(
     image: str,
-    cmd: list[str],
-    mount: Optional[str] = None,
+    cmd: list,
+    work_dir: Optional[Path] = None,
     timeout_sec: int = 300,
-    no_secrets: bool = True,
     env: Optional[dict] = None,
 ) -> ContainerResult:
     """
-    在 Docker 容器內執行指令。
-    M2 填入真實 docker run 呼叫。
+    Run a command inside a Docker container.
+
+    Args:
+        image:       Docker image name (e.g. "ai-company-worker")
+        cmd:         Command + args list
+        work_dir:    Host path mounted as /work (read-write)
+        timeout_sec: Wall-clock timeout; returns exit_code=-1 on expiry
+        env:         Extra env vars injected into container
+
+    Auth:
+        ~/.claude is mounted read-only at /root/.claude so that
+        claude -p can use the Claude Pro subscription inside the container.
     """
-    log.info("[M0-STUB] run_in_container image=%s cmd=%s", image, cmd)
-    # M2+ 真實實作：
-    # docker_cmd = [
-    #     "docker", "run", "--rm",
-    #     "--network", "bridge",
-    #     f"--timeout={timeout_sec}",
-    # ]
-    # if mount:
-    #     docker_cmd += ["-v", f"{mount}:/work"]
-    # if env:
-    #     for k, v in env.items():
-    #         docker_cmd += ["-e", f"{k}={v}"]
-    # docker_cmd += [image] + cmd
-    # proc = subprocess.run(docker_cmd, capture_output=True, text=True, timeout=timeout_sec)
-    # return ContainerResult(proc.returncode, proc.stdout, proc.stderr)
-    raise NotImplementedError("run_in_container：M2 尚未實作")
+    docker_cmd = ["docker", "run", "--rm", "--network", "bridge"]
+
+    # Claude Pro auth (read-only)
+    if CLAUDE_AUTH_DIR.exists():
+        docker_cmd += ["-v", f"{CLAUDE_AUTH_DIR}:/root/.claude:ro"]
+
+    # Work directory
+    if work_dir is not None:
+        docker_cmd += ["-v", f"{work_dir}:/work", "-w", "/work"]
+
+    # Extra environment
+    for k, v in (env or {}).items():
+        docker_cmd += ["-e", f"{k}={v}"]
+
+    docker_cmd += [image] + list(cmd)
+
+    log.info("run_in_container: %s", " ".join(str(x) for x in docker_cmd))
+
+    try:
+        proc = subprocess.run(
+            docker_cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+        return ContainerResult(proc.returncode, proc.stdout, proc.stderr)
+
+    except subprocess.TimeoutExpired:
+        log.error("Container timed out after %ds  work_dir=%s", timeout_sec, work_dir)
+        return ContainerResult(-1, "", f"Timed out after {timeout_sec}s")
+
+    except FileNotFoundError:
+        log.error("'docker' not found -- is Docker Desktop running?")
+        return ContainerResult(-2, "", "docker not found; ensure Docker Desktop is running")
 
 
-# ─── 測試查核 ────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------ #
+#  Test verification                                                    #
+# ------------------------------------------------------------------ #
 
-def tests_fail(card: dict) -> bool:
-    """
-    在容器內跑測試，預期 exit code != 0（紅）。
-    回傳 True 代表測試確實失敗（正確的 TDD 前置狀態）。
-    """
-    result = run_in_container(
+_TEST_CMD = [
+    "bash", "-lc",
+    # Detect Python tests or Node tests
+    ("if ls tests/*.py 2>/dev/null | head -1 | grep -q . || [ -f conftest.py ]; then "
+     "  pytest -q; "
+     "elif [ -f package.json ]; then "
+     "  npm test -- --watchAll=false; "
+     "else "
+     "  echo 'No test files found' && exit 1; "
+     "fi"),
+]
+
+
+def _run_tests_in_container(card: dict, work_dir: Path) -> ContainerResult:
+    return run_in_container(
         image="ai-company-worker",
-        cmd=["bash", "-lc", "pytest -q 2>/dev/null || npm test 2>/dev/null"],
-        mount=card_checkout_path(card),
+        cmd=_TEST_CMD,
+        work_dir=work_dir,
+        timeout_sec=300,
     )
+
+
+def tests_fail(card: dict, work_dir: Optional[Path] = None) -> bool:
+    """
+    Run tests expecting them to FAIL (TDD red state).
+    Returns True if tests actually fail (correct pre-implementation state).
+    """
+    wd = work_dir or worktree_path(card)
+    result = _run_tests_in_container(card, wd)
     is_red = result.exit_code != 0
-    log.info("tests_fail card=%s exit_code=%d → is_red=%s", card["id"], result.exit_code, is_red)
+    log.info("tests_fail  card=%s  exit_code=%d  is_red=%s", card["id"], result.exit_code, is_red)
+    if not is_red:
+        log.warning(
+            "Tests PASSED before implementation for %s -- agent may have written bad tests",
+            card["id"],
+        )
     return is_red
 
 
-def tests_pass(card: dict) -> bool:
+def tests_pass(card: dict, work_dir: Optional[Path] = None) -> bool:
     """
-    在容器內跑測試，預期 exit code == 0（綠）。
-    回傳 True 代表測試全部通過。
+    Run tests expecting them to PASS (TDD green state).
+    Returns True if all tests pass.
     """
-    result = run_in_container(
-        image="ai-company-worker",
-        cmd=["bash", "-lc", "pytest -q 2>/dev/null || npm test 2>/dev/null"],
-        mount=card_checkout_path(card),
-    )
+    wd = work_dir or worktree_path(card)
+    result = _run_tests_in_container(card, wd)
     is_green = result.exit_code == 0
-    log.info("tests_pass card=%s exit_code=%d → is_green=%s", card["id"], result.exit_code, is_green)
+    log.info("tests_pass  card=%s  exit_code=%d  is_green=%s", card["id"], result.exit_code, is_green)
     return is_green
 
 
-# ─── Git 查核 ────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------ #
+#  Git checks                                                           #
+# ------------------------------------------------------------------ #
 
-def pr_exists(card: dict) -> bool:
-    """
-    確認 GitHub 上這張卡的 PR 是否真實存在。
-    M3 填入 GitHub API 呼叫。
-    """
-    log.info("[M0-STUB] pr_exists card=%s", card["id"])
-    raise NotImplementedError("pr_exists：M3 尚未實作")
-
-
-def ci_green(card: dict) -> bool:
-    """
-    確認 PR 的 CI checks 全部通過。
-    M3 填入 GitHub API 呼叫。
-    """
-    log.info("[M0-STUB] ci_green card=%s", card["id"])
-    raise NotImplementedError("ci_green：M3 尚未實作")
-
-
-def branch_exists(branch: str, repo_path: Optional[str] = None) -> bool:
-    """確認 git branch 是否存在（本地或遠端）。"""
+def branch_exists(branch: str) -> bool:
+    """Check whether a local git branch exists."""
     try:
-        cmd = ["git", "branch", "--list", branch]
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, cwd=repo_path
+        r = subprocess.run(
+            ["git", "branch", "--list", branch],
+            cwd=REPO_ROOT, capture_output=True, text=True,
         )
-        return branch in result.stdout
+        return bool(r.stdout.strip())
     except Exception as e:
-        log.warning("branch_exists 失敗：%s", e)
+        log.warning("branch_exists failed: %s", e)
         return False
 
 
-# ─── 工具函式 ────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------ #
+#  M3+ stubs                                                           #
+# ------------------------------------------------------------------ #
 
-def card_checkout_path(card: dict) -> str:
-    """回傳這張卡的分支 checkout 路徑（供掛進容器用）。"""
-    branch = card.get("branch") or f"card/{card['id']}"
-    # M2+ 替換為實際 checkout 目錄
-    return f"/work/{branch}"
+def pr_exists(card: dict) -> bool:
+    """Check whether a GitHub PR exists for this card. M3."""
+    raise NotImplementedError("pr_exists: implemented in M3")
+
+
+def ci_green(card: dict) -> bool:
+    """Check whether CI is green for this card's PR. M3."""
+    raise NotImplementedError("ci_green: implemented in M3")

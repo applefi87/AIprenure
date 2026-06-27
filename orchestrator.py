@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 
 import db
 import agents
+import truth
 
 # Load .env from project root
 load_dotenv(Path(__file__).parent / ".env")
@@ -237,7 +238,8 @@ def _run_spec_agent(card: dict, cfg: dict) -> None:
             log.warning("  Could not insert task %s: %s", task_id, e)
 
     # Update story body with contract summary, advance to refined
-    db.update_card_status(card["id"], "refined", owner=None)
+    db.update_card_status(card["id"], "refined")
+    db.clear_card_owner(card["id"])
     db.insert_event(
         event_type="spec_done",
         actor="orchestrator",
@@ -283,7 +285,8 @@ def _next_task_id(story_id: str, index: int) -> str:
 
 
 def _pause_card(card_id: str, reason: str) -> None:
-    db.update_card_status(card_id, "paused", owner=None)
+    db.update_card_status(card_id, "paused")
+    db.clear_card_owner(card_id)
     db.insert_event(
         event_type="paused",
         actor="orchestrator",
@@ -295,28 +298,169 @@ def _pause_card(card_id: str, reason: str) -> None:
 
 
 # ------------------------------------------------------------------ #
-#  Task handler (M0 stub, M2+ real)                                    #
+#  Task handler — M2 TDD red-green loop                               #
 # ------------------------------------------------------------------ #
 
 def handle_task(card: dict, cfg: dict) -> None:
     status = card["status"]
 
     if status == "test_writing":
-        log.info("[M0-STUB] Test agent not yet implemented (M2), releasing %s", card["id"])
-        db.clear_card_owner(card["id"])
-        db.update_card_status(card["id"], "todo")
-
+        _run_test_agent(card, cfg)
     elif status == "coding":
-        log.info("[M0-STUB] Code agent not yet implemented (M2), releasing %s", card["id"])
+        _run_code_agent(card, cfg)
+    else:
+        log.warning("No task handler for status=%s (%s)", status, card["id"])
         db.clear_card_owner(card["id"])
 
-    else:
-        log.warning("[STUB] No task handler for status=%s (%s)", status, card["id"])
+
+def _inject_acs(card: dict) -> dict:
+    """Return a copy of card with _acceptance_criteria fetched from DB."""
+    card = dict(card)
+    card["_acceptance_criteria"] = db.get_ac_for_card(card["id"])
+    return card
+
+
+def _run_test_agent(card: dict, cfg: dict) -> None:
+    """
+    1. Run Test agent in container (writes failing tests, commits).
+    2. Verify tests actually FAIL (red) -- orchestrator enforces TDD.
+    3. On confirmed red  -> advance to coding.
+    4. On not-red        -> back to todo (bad tests, retry).
+    5. On agent error    -> retry or pause.
+    """
+    card = _inject_acs(card)
+    log.info("Running Test agent for task %s", card["id"])
+
+    try:
+        result = agents.run_coding_agent(card, "test")
+    except Exception as e:
+        log.error("Test agent raised exception for %s: %s", card["id"], e)
+        _handle_task_retry(card, cfg, f"Test agent exception: {e}")
+        return
+
+    if result["exit_code"] != 0:
+        log.error(
+            "Test agent process failed  card=%s  exit_code=%d",
+            card["id"], result["exit_code"],
+        )
+        _handle_task_retry(card, cfg, f"Test agent exited {result[chr(39) + chr(39) + 'exit_code' + chr(39) + chr(39)]}")
+        return
+
+    # Verify tests actually fail before implementation (TDD enforcement)
+    wt = truth.worktree_path(card)
+    if not truth.tests_fail(card, wt):
+        log.warning(
+            "Tests did NOT fail for %s -- agent wrote bad tests; resetting to todo",
+            card["id"],
+        )
+        db.increment_card_counter(card["id"], "loop_count")
+        db.update_card_status(card["id"], "todo")
         db.clear_card_owner(card["id"])
+        db.insert_event(
+            event_type="tests_not_red",
+            actor="orchestrator",
+            card_id=card["id"],
+            old_status="test_writing",
+            new_status="todo",
+            metadata={"reason": "tests passed before implementation"},
+        )
+        return
+
+    # Tests confirmed red -> advance to coding
+    db.update_card_status(card["id"], "coding")
+    db.clear_card_owner(card["id"])
+    db.insert_event(
+        event_type="tests_red",
+        actor="orchestrator",
+        card_id=card["id"],
+        old_status="test_writing",
+        new_status="coding",
+    )
+    log.info("Task %s tests confirmed RED -> coding", card["id"])
+
+
+def _run_code_agent(card: dict, cfg: dict) -> None:
+    """
+    1. Run Code agent in container (implements until tests pass).
+    2. Verify tests PASS (green) -- orchestrator enforces green before review.
+    3. On confirmed green -> advance to in_review.
+    4. On still-failing  -> retry coding or pause.
+    5. On agent error    -> retry or pause.
+    """
+    card = _inject_acs(card)
+    log.info("Running Code agent for task %s", card["id"])
+
+    try:
+        result = agents.run_coding_agent(card, "code")
+    except Exception as e:
+        log.error("Code agent raised exception for %s: %s", card["id"], e)
+        _handle_task_retry(card, cfg, f"Code agent exception: {e}")
+        return
+
+    # Verify tests pass
+    wt = truth.worktree_path(card)
+    if not truth.tests_pass(card, wt):
+        db.increment_card_counter(card["id"], "loop_count")
+        current = db.get_card(card["id"])
+        loop_count = current["loop_count"] if current else 0
+        review_max = cfg.get("limits", {}).get("review_max", 3)
+        log.warning(
+            "Tests still failing after code agent  card=%s  loop_count=%d",
+            card["id"], loop_count,
+        )
+        if loop_count >= review_max:
+            _pause_card(
+                card["id"],
+                f"Tests still failing after {loop_count} code attempts",
+            )
+        else:
+            db.update_card_status(card["id"], "coding")
+            db.clear_card_owner(card["id"])
+            db.insert_event(
+                event_type="tests_not_green",
+                actor="orchestrator",
+                card_id=card["id"],
+                metadata={"loop_count": loop_count},
+            )
+        return
+
+    # Tests green -> advance to in_review
+    db.update_card_status(card["id"], "in_review")
+    db.clear_card_owner(card["id"])
+    db.insert_event(
+        event_type="tests_green",
+        actor="orchestrator",
+        card_id=card["id"],
+        old_status="coding",
+        new_status="in_review",
+    )
+    log.info("Task %s tests GREEN -> in_review", card["id"])
+
+
+def _handle_task_retry(card: dict, cfg: dict, reason: str) -> None:
+    """Increment retry_count; pause if exhausted, else reset to todo."""
+    db.increment_card_counter(card["id"], "retry_count")
+    current = db.get_card(card["id"])
+    retry_count = current["retry_count"] if current else 0
+    retry_max = cfg.get("limits", {}).get("retry_max", 2)
+
+    if retry_count >= retry_max:
+        _pause_card(card["id"], f"Max retries ({retry_max}) reached: {reason}")
+    else:
+        db.update_card_status(card["id"], "todo")
+        db.clear_card_owner(card["id"])
+        db.insert_event(
+            event_type="retry",
+            actor="orchestrator",
+            card_id=card["id"],
+            new_status="todo",
+            metadata={"reason": reason, "retry_count": retry_count},
+        )
+        log.info("Task %s retry %d/%d: %s", card["id"], retry_count, retry_max, reason)
 
 
 def collect_finished_workers() -> None:
-    # Sync in M0/M1; M2+ polls subprocess exit codes
+    # Synchronous in M0-M2; M3+ would poll async subprocess exit codes
     pass
 
 
