@@ -84,12 +84,14 @@ def _remove_worker(worker_id: str) -> None:
 # (eligible_status, next_status, card_type)
 ELIGIBLE_TRANSITIONS = [
     # Story: Spec agent path
-    ("awaiting_approval", "refining", "story"),
+    ("awaiting_approval",  "refining",       "story"),
     # Task: TDD path (M2)
-    ("todo",        "test_writing", "task"),
-    ("coding",      "coding",       "task"),
-    # Task: GitHub PR + CI polling (M3)
-    ("in_review",   "in_review",    "task"),
+    ("todo",               "test_writing",   "task"),
+    ("coding",             "coding",         "task"),
+    # Task: Review agent (M4)
+    ("in_review",          "in_review",      "task"),
+    # Task: GitHub PR + CI + merge (M3, after review passes)
+    ("ready_to_merge",     "ready_to_merge", "task"),
 ]
 
 
@@ -312,6 +314,8 @@ def handle_task(card: dict, cfg: dict) -> None:
         _run_code_agent(card, cfg)
     elif status == "in_review":
         _handle_in_review(card, cfg)
+    elif status == "ready_to_merge":
+        _handle_ready_to_merge(card, cfg)
     else:
         log.warning("No task handler for status=%s (%s)", status, card["id"])
         db.clear_card_owner(card["id"])
@@ -465,13 +469,106 @@ def _handle_task_retry(card: dict, cfg: dict, reason: str) -> None:
 
 def _handle_in_review(card: dict, cfg: dict) -> None:
     """
-    M3: GitHub PR + CI polling loop.
+    M4: Review agent (Gemini) inspects PR diff + ACs.
+    On pass  -> advance to ready_to_merge.
+    On fail  -> back to coding with reasons (up to review_max times, then pause).
+    """
+    card = _inject_acs(card)
+    card_id = card["id"]
+    wt = truth.worktree_path(card)
 
-    State machine (card stays in_review between polls):
-      1. No PR yet       -> push branch + create PR -> release
-      2. CI pending      -> release (poll again next cycle)
-      3. CI success      -> trigger merge -> done
-      4. CI failure      -> reset to coding
+    # Get code diff for Review agent
+    try:
+        diff = truth.get_worktree_diff(wt)
+    except Exception as e:
+        log.warning("Could not get diff for %s: %s  (using empty diff)", card_id, e)
+        diff = "(diff unavailable)"
+
+    # Build ACs text
+    acs = card.get("_acceptance_criteria") or []
+    ac_lines = [str(i) + ". " + ac["text"] for i, ac in enumerate(acs, 1)]
+
+    context = {
+        "card_id": card_id,
+        "title": card["title"],
+        "acceptance_criteria": ac_lines,
+        "diff": diff,
+    }
+
+    try:
+        result = agents.call_reasoning_agent("review", context)
+    except Exception as e:
+        log.error("Review agent failed for %s: %s", card_id, e)
+        _handle_task_retry(card, cfg, "Review agent error: " + str(e))
+        return
+
+    verdict = result.get("verdict", "").lower()
+    reasons = result.get("reasons", [])
+
+    if verdict not in ("pass", "fail"):
+        log.error("Review agent returned invalid verdict %r for %s", verdict, card_id)
+        _handle_task_retry(card, cfg, "Invalid review verdict: " + str(verdict))
+        return
+
+    if verdict == "pass":
+        db.update_card_status(card_id, "ready_to_merge")
+        db.clear_card_owner(card_id)
+        db.insert_event(
+            event_type="review_pass",
+            actor="orchestrator",
+            card_id=card_id,
+            old_status="in_review",
+            new_status="ready_to_merge",
+        )
+        log.info("Review PASS for %s -> ready_to_merge", card_id)
+        return
+
+    # verdict == "fail"
+    db.increment_card_counter(card_id, "loop_count")
+    current = db.get_card(card_id)
+    loop_count = current["loop_count"] if current else 0
+    review_max = cfg.get("limits", {}).get("review_max", 3)
+
+    log.warning(
+        "Review FAIL for %s (loop %d/%d): %s",
+        card_id, loop_count, review_max, reasons,
+    )
+
+    if loop_count >= review_max:
+        _pause_card(card_id, "Max reviews (" + str(review_max) + ") failed: " + str(reasons))
+        return
+
+    # Inject rejection reasons into card body so Code agent sees them
+    reason_text = "\n".join("- " + r for r in reasons)
+    rejection_note = "\n\n[Review rejection #" + str(loop_count) + "]\n" + reason_text
+    updated_body = (card.get("body") or "") + rejection_note
+    with __import__("db").get_conn() as conn:
+        conn.execute(
+            "UPDATE cards SET body=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (updated_body, card_id),
+        )
+
+    db.update_card_status(card_id, "coding")
+    db.clear_card_owner(card_id)
+    db.insert_event(
+        event_type="review_fail",
+        actor="orchestrator",
+        card_id=card_id,
+        old_status="in_review",
+        new_status="coding",
+        metadata={"loop_count": loop_count, "reasons": reasons},
+    )
+
+
+def _handle_ready_to_merge(card: dict, cfg: dict) -> None:
+    """
+    M3: GitHub PR + CI polling loop (runs after Review agent passes).
+
+    State machine (card stays ready_to_merge between polls):
+      1. No PR yet   -> push branch + create PR -> release
+      2. CI pending  -> release (poll again next cycle)
+      3. CI success  -> trigger merge -> done
+      4. CI failure  -> reset to coding
     """
     import github_api
 
@@ -484,13 +581,13 @@ def _handle_in_review(card: dict, cfg: dict) -> None:
         existing = github_api.get_pr_for_branch(card)
         if existing:
             pr_number = existing["number"]
-            db.update_card_status(card_id, "in_review", pr_number=pr_number)
+            db.update_card_status(card_id, "ready_to_merge", pr_number=pr_number)
             log.info("Found existing PR #%d for %s", pr_number, card_id)
         else:
             try:
                 github_api.push_branch(card, wt)
                 pr_number = github_api.create_pr(card)
-                db.update_card_status(card_id, "in_review", pr_number=pr_number)
+                db.update_card_status(card_id, "ready_to_merge", pr_number=pr_number)
                 db.insert_event(
                     event_type="pr_created",
                     actor="orchestrator",
@@ -503,7 +600,7 @@ def _handle_in_review(card: dict, cfg: dict) -> None:
                 _handle_task_retry(card, cfg, "PR creation failed: " + str(e))
                 return
         db.clear_card_owner(card_id)
-        return  # release; next poll checks CI
+        return
 
     # Step 2-4: PR exists, check CI
     try:
@@ -534,7 +631,7 @@ def _handle_in_review(card: dict, cfg: dict) -> None:
                 event_type="merged",
                 actor="orchestrator",
                 card_id=card_id,
-                old_status="in_review",
+                old_status="ready_to_merge",
                 new_status="done",
                 metadata={"pr_number": pr_number},
             )
@@ -553,10 +650,11 @@ def _handle_in_review(card: dict, cfg: dict) -> None:
         event_type="ci_failed",
         actor="orchestrator",
         card_id=card_id,
-        old_status="in_review",
+        old_status="ready_to_merge",
         new_status="coding",
         metadata={"pr_number": pr_number},
     )
+
 
 
 def collect_finished_workers() -> None:

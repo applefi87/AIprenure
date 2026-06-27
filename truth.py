@@ -245,3 +245,26 @@ def ci_green(card: dict) -> bool:
     if not pr_number:
         return False
     return github_api.get_ci_status(pr_number) == "success"
+
+
+# ------------------------------------------------------------------ #
+#  Code diff helper (M4)                                               #
+# ------------------------------------------------------------------ #
+
+def get_worktree_diff(worktree: Path, max_chars: int = 8000) -> str:
+    """
+    Return the git diff of committed work in the worktree.
+    Uses git log -p -5 to capture the last 5 commits.
+    Truncated to max_chars to avoid LLM token overflow.
+    """
+    result = subprocess.run(
+        ["git", "log", "-p", "--no-merges", "-5",
+         "--format=commit %H%n%s%n"],
+        cwd=worktree,
+        capture_output=True,
+        text=True,
+    )
+    diff = result.stdout or "(no commits in worktree)"
+    if len(diff) > max_chars:
+        diff = diff[:max_chars] + "\n...(diff truncated)"
+    return diff
