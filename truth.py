@@ -247,6 +247,82 @@ def ci_green(card: dict) -> bool:
     return github_api.get_ci_status(pr_number) == "success"
 
 
+
+
+# ------------------------------------------------------------------ #
+#  E2E gate (M5)                                                       #
+# ------------------------------------------------------------------ #
+
+_E2E_CMD = [
+    "bash", "-lc",
+    (
+        "if find tests/e2e -name '*.py' 2>/dev/null | grep -q . ; then "
+        "  pytest tests/e2e/ -q; "
+        "elif find tests/e2e -name '*.spec.*' 2>/dev/null | grep -q . ; then "
+        "  playwright test tests/e2e/ --reporter=line; "
+        "elif [ -f playwright.config.ts ] || [ -f playwright.config.js ]; then "
+        "  playwright test --reporter=line; "
+        "else "
+        "  echo 'No E2E tests found -- trivial pass' && exit 0; "
+        "fi"
+    ),
+]
+
+
+def setup_story_e2e(story: dict) -> Path:
+    """
+    Create a worktree on the 'dev' branch for running E2E tests.
+    Returns the worktree path (used as Docker volume mount).
+    """
+    story_id = story["id"]
+    e2e_dir = WORKTREES_DIR / ("e2e_" + story_id)
+    WORKTREES_DIR.mkdir(parents=True, exist_ok=True)
+
+    if e2e_dir.exists():
+        log.debug("E2E worktree already exists: %s", e2e_dir)
+        return e2e_dir
+
+    subprocess.run(
+        ["git", "worktree", "add", str(e2e_dir), "dev"],
+        cwd=REPO_ROOT, check=True,
+    )
+    log.info("E2E worktree created: %s  (story=%s)", e2e_dir, story_id)
+    return e2e_dir
+
+
+def teardown_story_e2e(story: dict) -> None:
+    """Remove E2E worktree after gate finishes."""
+    story_id = story["id"]
+    e2e_dir = WORKTREES_DIR / ("e2e_" + story_id)
+    subprocess.run(
+        ["git", "worktree", "remove", str(e2e_dir), "--force"],
+        cwd=REPO_ROOT, capture_output=True,
+    )
+    log.info("E2E worktree removed: %s", e2e_dir)
+
+
+def e2e_pass(story: dict, work_dir: Path) -> bool:
+    """
+    Run E2E tests for a story in the container.
+    Returns True if tests pass (exit_code == 0).
+    If no E2E tests exist, returns True (trivial pass).
+    """
+    result = run_in_container(
+        image="ai-company-worker",
+        cmd=_E2E_CMD,
+        work_dir=work_dir,
+        timeout_sec=600,
+    )
+    passed = result.exit_code == 0
+    log.info(
+        "e2e_pass  story=%s  exit_code=%d  passed=%s",
+        story["id"], result.exit_code, passed,
+    )
+    if not passed:
+        log.warning("E2E failed  story=%s\nstdout: %s", story["id"], result.stdout[-2000:])
+    return passed
+
+
 # ------------------------------------------------------------------ #
 #  Code diff helper (M4)                                               #
 # ------------------------------------------------------------------ #

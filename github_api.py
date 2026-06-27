@@ -211,9 +211,54 @@ def trigger_merge(pr_number: int, card_id: str) -> None:
     log.info("Triggered merge.yml for PR #%d  (card=%s)", pr_number, card_id)
 
 
+def merge_dev_to_main(story_id: str) -> None:
+    """
+    Create a PR from dev->main and squash-merge it.
+    Called after human /approve <story_id> on Telegram.
+    """
+    repo = _repo()
+    title = "[" + story_id + "] Promote dev -> main"
+    body_text = (
+        "Promoted to main after human approval of story " + story_id + ".\n"
+        "_Automatic merge by AI Company orchestrator._"
+    )
+
+    pr_number: int
+    try:
+        resp = _api("POST", "/repos/" + repo + "/pulls", {
+            "title": title,
+            "body": body_text,
+            "head": "dev",
+            "base": "main",
+            "draft": False,
+        })
+        pr_number = resp["number"]
+        log.info("Created dev->main PR #%d for story %s", pr_number, story_id)
+    except RuntimeError as e:
+        if "A pull request already exists" in str(e):
+            prs = _api(
+                "GET",
+                "/repos/" + repo + "/pulls?state=open"
+                "&head=" + _owner() + ":dev&base=main&per_page=1",
+            )
+            if not prs:
+                raise RuntimeError("dev->main PR already exists but not found") from e
+            pr_number = prs[0]["number"]
+            log.info("Reusing existing dev->main PR #%d for story %s", pr_number, story_id)
+        else:
+            raise
+
+    time.sleep(3)
+    _api("PUT", "/repos/" + repo + "/pulls/" + str(pr_number) + "/merge", {
+        "commit_title": title,
+        "merge_method": "squash",
+    })
+    log.info("Merged dev->main PR #%d for story %s", pr_number, story_id)
+
+
 def wait_for_merge(pr_number: int, max_polls: int = 20, interval_sec: int = 15) -> bool:
     """
-    Poll until the PR is merged (state == closed + merged) or max_polls exceeded.
+    Poll until the PR is merged or max_polls exceeded.
     Returns True if merged, False if timed out or closed without merge.
     """
     repo = _repo()

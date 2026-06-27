@@ -1,78 +1,157 @@
 """
-telegram_bot.py — 人類命令入口（M5 填入實作）
-===============================================
-只做一件事：把人類的 Telegram 指令轉成一筆事件寫進 DB。
-不做任何業務邏輯；編排器輪詢 DB 才是動作的觸發點。
+telegram_bot.py — Telegram 人類核准入口（M5）
+==============================================
+純 stdlib urllib — 不需要 python-telegram-bot 套件。
 
-支援指令：
-  /new <需求文字>     → 建立 story 卡（status=backlog）並寫事件
-  /approve <card_id>  → 人類核准，寫 human_approve 事件
-  /status [card_id]   → 回報目前狀態（直接查 DB 回覆）
-  /pause <card_id>    → 強制把卡轉 paused
+需在 .env 設定：
+  TELEGRAM_BOT_TOKEN=123456:ABCdef...
+  TELEGRAM_CHAT_ID=-100123456789  (群組 ID 或個人 chat_id)
 
-M0-M4：stub（不啟動，避免缺 token 報錯）。
-M5：替換為真實 python-telegram-bot 實作。
+公開 API（由編排器主迴圈呼叫）：
+  send_message(text)          -> 傳送通知給人類
+  get_pending_approvals()     -> 輪詢，回傳 /approve <story_id> 清單
 """
 
+import json
 import logging
 import os
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 log = logging.getLogger("telegram_bot")
 
+_OFFSET_FILE = Path(__file__).parent / "data" / ".telegram_offset"
+
+
+def _token() -> str:
+    t = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not t:
+        raise EnvironmentError("TELEGRAM_BOT_TOKEN 未設定")
+    return t
+
+
+def _chat_id() -> str:
+    c = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not c:
+        raise EnvironmentError("TELEGRAM_CHAT_ID 未設定")
+    return c
+
+
+def is_configured() -> bool:
+    return bool(
+        os.environ.get("TELEGRAM_BOT_TOKEN", "").strip() and
+        os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    )
+
+
+def _api_get(method: str, params: dict = None) -> object:
+    url = "https://api.telegram.org/bot" + _token() + "/" + method
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": "ai-company/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        err = e.read().decode(errors="replace")
+        raise RuntimeError("Telegram GET " + method + " error " + str(e.code) + ": " + err) from e
+    if not body.get("ok"):
+        raise RuntimeError("Telegram not ok: " + str(body))
+    return body.get("result")
+
+
+def _api_post(method: str, data: dict) -> object:
+    url = "https://api.telegram.org/bot" + _token() + "/" + method
+    payload = json.dumps(data).encode()
+    req = urllib.request.Request(
+        url, data=payload, method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": "ai-company/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        err = e.read().decode(errors="replace")
+        raise RuntimeError("Telegram POST " + method + " error " + str(e.code) + ": " + err) from e
+    if not body.get("ok"):
+        raise RuntimeError("Telegram not ok: " + str(body))
+    return body.get("result")
+
+
+def send_message(text: str) -> None:
+    """傳送文字訊息到設定的 chat。失敗只記 log，不拋例外。"""
+    if not is_configured():
+        log.debug("Telegram 未設定，跳過：%s", text[:60])
+        return
+    try:
+        _api_post("sendMessage", {
+            "chat_id": _chat_id(),
+            "text": text,
+            "parse_mode": "HTML",
+        })
+        log.info("Telegram 已傳送：%s", text[:80])
+    except Exception as e:
+        log.error("Telegram 傳送失敗：%s", e)
+
+
+def _load_offset() -> int:
+    try:
+        return int(_OFFSET_FILE.read_text().strip())
+    except Exception:
+        return 0
+
+
+def _save_offset(offset: int) -> None:
+    try:
+        _OFFSET_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _OFFSET_FILE.write_text(str(offset))
+    except Exception as e:
+        log.warning("無法儲存 telegram offset：%s", e)
+
+
+def get_pending_approvals() -> list:
+    """
+    非阻塞輪詢 Telegram（timeout=0）。
+    解析 /approve <story_id> 指令，回傳核准的 story_id 清單。
+    自動推進 offset，不重播已處理的訊息。
+    """
+    if not is_configured():
+        return []
+    offset = _load_offset()
+    try:
+        updates = _api_get("getUpdates", {"offset": offset, "timeout": 0})
+    except Exception as e:
+        log.error("Telegram getUpdates 失敗：%s", e)
+        return []
+    if not isinstance(updates, list):
+        return []
+    approved = []
+    max_uid = offset - 1
+    for upd in updates:
+        uid = upd.get("update_id", 0)
+        max_uid = max(max_uid, uid)
+        msg = upd.get("message") or upd.get("channel_post") or {}
+        text = (msg.get("text") or "").strip()
+        if text.lower().startswith("/approve"):
+            parts = text.split(None, 1)
+            if len(parts) >= 2:
+                story_id = parts[1].strip()
+                approved.append(story_id)
+                log.info("Telegram 核准：story=%s", story_id)
+    if max_uid >= offset:
+        _save_offset(max_uid + 1)
+    return approved
+
 
 def run_bot() -> None:
-    """
-    啟動 Telegram bot。
-    M5 填入真實實作：
-      from telegram.ext import Application, CommandHandler
-      app = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
-      app.add_handler(CommandHandler("new", cmd_new))
-      app.add_handler(CommandHandler("approve", cmd_approve))
-      app.add_handler(CommandHandler("status", cmd_status))
-      app.add_handler(CommandHandler("pause", cmd_pause))
-      app.run_polling()
-    """
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        log.warning("TELEGRAM_BOT_TOKEN 未設定，telegram_bot 不啟動（M5 前正常）")
-        return
-    raise NotImplementedError("telegram_bot：M5 尚未實作")
-
-
-# ─── 指令處理器（M5 填入）────────────────────────────────────────────────
-
-async def cmd_new(update, context) -> None:
-    """
-    /new <需求文字>
-    建立 story 卡（status=backlog），寫 human_new 事件。
-    """
-    raise NotImplementedError
-
-
-async def cmd_approve(update, context) -> None:
-    """
-    /approve <card_id>
-    寫 human_approve 事件；編排器看到後執行合併。
-    """
-    raise NotImplementedError
-
-
-async def cmd_status(update, context) -> None:
-    """
-    /status [card_id]
-    查 DB 回傳目前狀態，不改任何東西。
-    """
-    raise NotImplementedError
-
-
-async def cmd_pause(update, context) -> None:
-    """
-    /pause <card_id>
-    強制把卡轉 paused（人類介入）。
-    """
-    raise NotImplementedError
+    """M5 起改為輪詢模式，此函式保留以避免呼叫點報錯。"""
+    log.info("telegram_bot.run_bot() 已廢棄（M5 改為 get_pending_approvals() 輪詢）")
 
 
 if __name__ == "__main__":
-    run_bot()
+    from dotenv import load_dotenv
+    load_dotenv()
+    send_message("AI Company 機器人連線測試 — 設定正常！")
+    print("已傳送測試訊息")

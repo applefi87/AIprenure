@@ -244,12 +244,34 @@ def get_events(card_id: Optional[str] = None, limit: int = 50) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+# ─── M5：Story 完成監控 ──────────────────────────────────────────────────
+
+def get_tasks_for_story(story_id: str) -> list:
+    """回傳某 story 底下的所有 task 卡（依 parent_id 查詢）。"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM cards WHERE parent_id = ? AND type = 'task' ORDER BY created_at",
+            (story_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_stories_by_status(status: str) -> list:
+    """回傳指定狀態的所有 story 卡。"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM cards WHERE type = 'story' AND status = ? ORDER BY created_at",
+            (status,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ─── CLI 工具（手動 seed / 查詢）────────────────────────────────────────
+
 
 def _seed_test_card() -> None:
     """開發用：手動塞一張 todo 子卡，供 M0 驗收。"""
     init_db()
-    # 先塞一張母卡
     story_id = "S-001"
     try:
         insert_card(
@@ -263,14 +285,13 @@ def _seed_test_card() -> None:
     except sqlite3.IntegrityError:
         print(f"[db] {story_id} 已存在，跳過")
 
-    # 塞一張 todo 子卡
     task_id = "T-001"
     try:
         insert_card(
             card_id=task_id,
             card_type="task",
             title="[SEED] 加 GET /health 端點",
-            body="回傳 {\"status\": \"ok\"}",
+            body='{"status": "ok"}',
             parent_id=story_id,
             status="todo",
             branch="card/T-001",

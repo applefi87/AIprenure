@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 import db
 import agents
 import truth
+import telegram_bot
 
 # Load .env from project root
 load_dotenv(Path(__file__).parent / ".env")
@@ -92,6 +93,8 @@ ELIGIBLE_TRANSITIONS = [
     ("in_review",          "in_review",      "task"),
     # Task: GitHub PR + CI + merge (M3, after review passes)
     ("ready_to_merge",     "ready_to_merge", "task"),
+    # Story: E2E gate (M5) — advanced to 'e2e' by _check_story_completion()
+    ("e2e",                "e2e",            "story"),
 ]
 
 
@@ -110,6 +113,8 @@ def main_loop(cfg: dict) -> None:
         try:
             time.sleep(poll)
             collect_finished_workers()
+            _check_story_completion()          # M5: refined→e2e when all tasks done
+            _process_telegram_approvals(cfg)   # M5: /approve → delivered
             free_slots = pool_size - count_active_workers()
             for _ in range(free_slots):
                 if not try_claim_next(cfg):
@@ -182,6 +187,8 @@ def handle_story(card: dict, cfg: dict) -> None:
 
     if status == "refining":
         _run_spec_agent(card, cfg)
+    elif status == "e2e":
+        _run_e2e_gate(card, cfg)
     else:
         log.warning("[STUB] No handler for story status=%s (%s)", status, card["id"])
         db.clear_card_owner(card["id"])
@@ -660,6 +667,152 @@ def _handle_ready_to_merge(card: dict, cfg: dict) -> None:
 def collect_finished_workers() -> None:
     # Synchronous in M0-M3; future async poll goes here
     pass
+
+
+# ------------------------------------------------------------------ #
+#  M5: Story completion monitor                                        #
+# ------------------------------------------------------------------ #
+
+def _check_story_completion() -> None:
+    """
+    Advance stories from 'refined' to 'e2e' when ALL their tasks are 'done'.
+    Called every poll cycle.
+    """
+    for story in db.list_stories_by_status("refined"):
+        story_id = story["id"]
+        if story.get("owner"):
+            continue
+        tasks = db.get_tasks_for_story(story_id)
+        if not tasks:
+            continue
+        if all(t["status"] == "done" for t in tasks):
+            db.update_card_status(story_id, "e2e")
+            db.insert_event(
+                event_type="all_tasks_done",
+                actor="orchestrator",
+                card_id=story_id,
+                old_status="refined",
+                new_status="e2e",
+                metadata={"task_count": len(tasks)},
+            )
+            log.info("Story %s: all %d tasks done -> e2e", story_id, len(tasks))
+
+
+# ------------------------------------------------------------------ #
+#  M5: E2E gate                                                        #
+# ------------------------------------------------------------------ #
+
+def _run_e2e_gate(card: dict, cfg: dict) -> None:
+    """
+    Run Playwright / pytest E2E tests on the 'dev' branch for this story.
+    On pass  -> story advances to 'done', Telegram notifies human for approval.
+    On fail  -> story paused, Telegram notifies of failure.
+    """
+    story_id = card["id"]
+    log.info("Running E2E gate for story %s", story_id)
+
+    try:
+        e2e_dir = truth.setup_story_e2e(card)
+    except Exception as e:
+        log.error("E2E worktree setup failed for %s: %s", story_id, e)
+        _pause_card(story_id, "E2E worktree setup failed: " + str(e))
+        telegram_bot.send_message(
+            "<b>E2E FAILED</b> — Story <code>" + story_id + "</code>\n"
+            "Could not set up E2E environment: " + str(e)
+        )
+        return
+
+    passed = truth.e2e_pass(card, e2e_dir)
+
+    if passed:
+        db.update_card_status(story_id, "done")
+        db.clear_card_owner(story_id)
+        db.insert_event(
+            event_type="e2e_pass",
+            actor="orchestrator",
+            card_id=story_id,
+            old_status="e2e",
+            new_status="done",
+        )
+        log.info("E2E PASS for story %s -> done", story_id)
+        telegram_bot.send_message(
+            "E2E passed for story <code>" + story_id + "</code>\n"
+            "Reply <b>/approve " + story_id + "</b> to merge to main."
+        )
+        try:
+            truth.teardown_story_e2e(card)
+        except Exception as e:
+            log.warning("E2E worktree teardown failed: %s", e)
+    else:
+        _pause_card(story_id, "E2E tests failed")
+        telegram_bot.send_message(
+            "<b>E2E FAILED</b> — Story <code>" + story_id + "</code>\n"
+            "Check logs and investigate. Card is now paused."
+        )
+        try:
+            truth.teardown_story_e2e(card)
+        except Exception as e:
+            log.warning("E2E worktree teardown failed: %s", e)
+
+
+# ------------------------------------------------------------------ #
+#  M5: Telegram human approval handler                                 #
+# ------------------------------------------------------------------ #
+
+def _process_telegram_approvals(cfg: dict) -> None:
+    """
+    Poll Telegram for /approve <story_id> commands.
+    For each approved story in 'done' state: merge dev->main -> 'delivered'.
+    """
+    approved_ids = telegram_bot.get_pending_approvals()
+    if not approved_ids:
+        return
+
+    import github_api
+
+    for story_id in approved_ids:
+        story = db.get_card(story_id)
+        if not story:
+            log.warning("Approval for unknown story %s -- ignored", story_id)
+            telegram_bot.send_message(
+                "Story <code>" + story_id + "</code> not found -- ignoring."
+            )
+            continue
+
+        if story["status"] != "done":
+            log.warning(
+                "Approval for story %s but status=%s (expected 'done') -- ignored",
+                story_id, story["status"],
+            )
+            telegram_bot.send_message(
+                "Story <code>" + story_id + "</code> is in status <b>" +
+                story["status"] + "</b>, not 'done' -- cannot approve yet."
+            )
+            continue
+
+        log.info("Human approved story %s -> merging dev->main", story_id)
+        try:
+            github_api.merge_dev_to_main(story_id)
+        except Exception as e:
+            log.error("dev->main merge failed for %s: %s", story_id, e)
+            telegram_bot.send_message(
+                "<b>Merge FAILED</b> for <code>" + story_id + "</code>: " + str(e)
+            )
+            continue
+
+        db.update_card_status(story_id, "delivered")
+        db.clear_card_owner(story_id)
+        db.insert_event(
+            event_type="delivered",
+            actor="human",
+            card_id=story_id,
+            old_status="done",
+            new_status="delivered",
+        )
+        log.info("Story %s delivered (merged to main)", story_id)
+        telegram_bot.send_message(
+            "Story <code>" + story_id + "</code> merged to <b>main</b> — DELIVERED!"
+        )
 
 
 # ------------------------------------------------------------------ #
