@@ -1,0 +1,57 @@
+# Dockerfile.worker — AI 開發公司 沙盒執行映像
+# 用途：Test agent 和 Code agent 在這個隔離環境內跑
+# 包含：Node.js + Python + Claude Code + Playwright + 測試工具鏈
+
+FROM ubuntu:22.04
+
+# 避免互動式提示
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ─── 基礎工具 ──────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y \
+    curl wget git \
+    python3 python3-pip python3-venv \
+    build-essential \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─── Node.js 20 LTS ───────────────────────────────────────────────────
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─── Claude Code（執行型 agent harness）──────────────────────────────
+# 不要自己造 harness；用 @anthropic-ai/claude-code
+RUN npm install -g @anthropic-ai/claude-code
+
+# ─── Python 測試工具 ──────────────────────────────────────────────────
+RUN pip3 install --no-cache-dir \
+    pytest \
+    pytest-asyncio \
+    httpx \
+    fastapi \
+    uvicorn
+
+# ─── Node 測試工具 ───────────────────────────────────────────────────
+RUN npm install -g jest vitest
+
+# ─── Playwright + Chromium（E2E 用）──────────────────────────────────
+RUN pip3 install --no-cache-dir playwright \
+    && playwright install chromium --with-deps
+
+# ─── Git 設定（Test/Code agent 需要在容器內 commit）─────────────────
+RUN git config --global user.name "AI Company Worker" \
+    && git config --global user.email "worker@ai-company.local" \
+    && git config --global safe.directory '*'
+
+# ─── 工作目錄 ────────────────────────────────────────────────────────
+WORKDIR /work
+
+# ─── 安全：不以 root 跑（M2+ 可加非 root user）──────────────────────
+# 目前 v1 先用 root 跑，Phase 2 加入 --user nobody
+
+# ─── 環境變數（由編排器在 docker run 時注入，不在映像內硬編）────────
+# ANTHROPIC_API_KEY  — 臨時 API 金鑰
+# GITHUB_TOKEN       — 低權限 git token（只能推 card/* feature/*）
+
+CMD ["bash"]
